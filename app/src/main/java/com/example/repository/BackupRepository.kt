@@ -302,8 +302,8 @@ class BackupRepository(private val context: Context) {
 
     fun scanLocalVault() {
         val host = _currentHostDevice.value ?: return
-        val folder = File(_selectedVaultPath.value.ifEmpty { StorageUtils.getDefaultVaultFolder(context).absolutePath })
-        val (files, summary) = StorageUtils.scanFolder(folder, host.deviceId, host.vaultId)
+        val path = _selectedVaultPath.value
+        val (files, summary) = StorageUtils.scanVault(context, path, host.deviceId, host.vaultId)
 
         _hostFiles.value = files
         _vaultSummary.value = summary

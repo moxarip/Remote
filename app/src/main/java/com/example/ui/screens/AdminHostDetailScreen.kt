@@ -95,7 +95,8 @@ fun AdminHostDetailScreen(
     onSelectAllFiles: (List<VaultFile>) -> Unit,
     onClearSelection: () -> Unit,
     onCategoryChanged: (String) -> Unit,
-    onSearchChanged: (String) -> Unit
+    onSearchChanged: (String) -> Unit,
+    onRefreshFiles: () -> Unit = {}
 ) {
     BackHandler { onBack() }
 
@@ -140,6 +141,17 @@ fun AdminHostDetailScreen(
                         Spacer(modifier = Modifier.width(6.dp))
                         BatteryBadge(percent = host.batteryPercent)
                     }
+                }
+
+                IconButton(
+                    onClick = onRefreshFiles,
+                    modifier = Modifier.testTag("admin_refresh_files_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = "Refresh Files",
+                        tint = ElectricBlue
+                    )
                 }
             }
         },

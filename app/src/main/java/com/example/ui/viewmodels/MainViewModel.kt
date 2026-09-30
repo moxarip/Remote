@@ -201,6 +201,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun selectHost(host: HostDevice) {
         _selectedHost.value = host
         _adminSelectedFileIds.value = emptySet()
+        refreshSelectedHostFiles()
+    }
+
+    fun refreshSelectedHostFiles() {
+        val host = _selectedHost.value ?: return
+        viewModelScope.launch {
+            _isScanning.value = true
+            FirebaseManager.fetchHostFiles(host.deviceId)
+            _isScanning.value = false
+        }
     }
 
     fun clearSelectedHost() {

@@ -269,4 +269,74 @@ object StorageUtils {
 
         return Pair(fileList, summary)
     }
+
+    fun resolvePathFromTreeUri(treeUri: Uri): String? {
+        val uriStr = treeUri.toString()
+        val docId = when {
+            uriStr.contains("/tree/") -> {
+                val segment = uriStr.substringAfter("/tree/").substringBefore("/document/")
+                Uri.decode(segment)
+            }
+            uriStr.contains("/document/") -> {
+                val segment = uriStr.substringAfter("/document/")
+                Uri.decode(segment)
+            }
+            else -> treeUri.path ?: ""
+        }
+
+        if (docId.contains("primary:")) {
+            val relative = docId.substringAfter("primary:")
+            val extDir = Environment.getExternalStorageDirectory().absolutePath
+            return if (relative.isBlank()) extDir else "$extDir/$relative"
+        }
+        return null
+    }
+
+    fun scanVault(context: Context, pathOrUri: String, hostDeviceId: String, vaultId: String): Pair<List<VaultFile>, VaultSummary> {
+        val clean = pathOrUri.trim()
+        if (clean.isBlank()) {
+            val def = getDefaultVaultFolder(context)
+            return scanFolder(def, hostDeviceId, vaultId)
+        }
+
+        if (clean.startsWith("content://")) {
+            val uri = Uri.parse(clean)
+            // 1. Try real filesystem path resolution first for direct file access
+            val realPath = resolvePathFromTreeUri(uri)
+            if (realPath != null) {
+                val realDir = File(realPath)
+                if (realDir.exists() && realDir.canRead()) {
+                    val result = scanFolder(realDir, hostDeviceId, vaultId)
+                    if (result.first.isNotEmpty()) {
+                        return result
+                    }
+                }
+            }
+
+            // 2. Scan via SAF DocumentFile
+            val docResult = scanDocumentTree(context, uri, hostDeviceId, vaultId)
+            if (docResult.first.isNotEmpty()) {
+                return docResult
+            }
+
+            // 3. If SAF returned 0, try realDir if exists even if canRead was false
+            if (realPath != null) {
+                val realDir = File(realPath)
+                if (realDir.exists()) {
+                    val result = scanFolder(realDir, hostDeviceId, vaultId)
+                    if (result.first.isNotEmpty()) return result
+                }
+            }
+
+            return docResult
+        } else {
+            val folder = File(clean)
+            if (folder.exists()) {
+                return scanFolder(folder, hostDeviceId, vaultId)
+            }
+            val def = getDefaultVaultFolder(context)
+            return scanFolder(def, hostDeviceId, vaultId)
+        }
+    }
 }
+

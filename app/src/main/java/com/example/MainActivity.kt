@@ -202,6 +202,9 @@ fun RemoteBackupAppContent(viewModel: MainViewModel) {
 
             AppScreen.ADMIN_HOST_DETAIL -> {
                 selectedHost?.let { host ->
+                    LaunchedEffect(host.deviceId) {
+                        viewModel.refreshSelectedHostFiles()
+                    }
                     AdminHostDetailScreen(
                         host = host,
                         files = selectedHostFiles,
@@ -219,7 +222,8 @@ fun RemoteBackupAppContent(viewModel: MainViewModel) {
                         onSelectAllFiles = viewModel::selectAllFiles,
                         onClearSelection = viewModel::clearFileSelection,
                         onCategoryChanged = viewModel::setFilterCategory,
-                        onSearchChanged = viewModel::setSearchQuery
+                        onSearchChanged = viewModel::setSearchQuery,
+                        onRefreshFiles = viewModel::refreshSelectedHostFiles
                     )
                 } ?: run {
                     currentScreen = AppScreen.ADMIN_DASHBOARD
