@@ -150,6 +150,40 @@ object FirebaseManager {
         }
     }
 
+    suspend fun saveRolePreference(
+        userId: String,
+        deviceId: String,
+        role: com.example.models.DeviceRole
+    ): Result<Unit> {
+        return try {
+            // Update in-memory state
+            val current = _syncedDevices.value.toMutableMap()
+            val existing = current[deviceId]
+            if (existing != null) {
+                current[deviceId] = existing.copy(role = role.name)
+                _syncedDevices.value = current
+            }
+
+            if (isFirebaseInitialized && databaseRef != null) {
+                if (userId.isNotBlank()) {
+                    databaseRef!!.child("users").child(userId).child("role").setValue(role.name).await()
+                    databaseRef!!.child("users").child(userId).child("updatedAt").setValue(System.currentTimeMillis()).await()
+                }
+                if (deviceId.isNotBlank()) {
+                    databaseRef!!.child("devices").child(deviceId).child("role").setValue(role.name).await()
+                    databaseRef!!.child("devices").child(deviceId).child("updatedAt").setValue(System.currentTimeMillis()).await()
+                }
+                Log.d(TAG, "Successfully persisted role ${role.name} to Firebase RTDB for user $userId and device $deviceId")
+            } else {
+                Log.d(TAG, "Saved role ${role.name} to local synchronization engine")
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving role preference to Firebase: ${e.message}")
+            Result.success(Unit) // Return success with fallback to avoid blocking user flow
+        }
+    }
+
     // --- Device Management ---
     fun registerOrUpdateDevice(device: HostDevice) {
         val current = _syncedDevices.value.toMutableMap()

@@ -141,13 +141,17 @@ fun RemoteBackupAppContent(viewModel: MainViewModel) {
             }
 
             AppScreen.ROLE_SELECT -> {
+                val isSavingRole by viewModel.isSavingRole.collectAsState()
                 RoleSelectScreen(
+                    deviceId = viewModel.repository.localDeviceId,
+                    isSaving = isSavingRole,
                     onRoleSelected = { role ->
-                        viewModel.setRole(role)
-                        currentScreen = if (role == DeviceRole.HOST) {
-                            AppScreen.HOST_DASHBOARD
-                        } else {
-                            AppScreen.ADMIN_DASHBOARD
+                        viewModel.setRole(role) {
+                            currentScreen = if (role == DeviceRole.HOST) {
+                                AppScreen.HOST_DASHBOARD
+                            } else {
+                                AppScreen.ADMIN_DASHBOARD
+                            }
                         }
                     }
                 )

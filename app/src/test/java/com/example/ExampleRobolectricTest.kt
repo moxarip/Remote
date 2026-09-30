@@ -36,4 +36,10 @@ class ExampleRobolectricTest {
     assertEquals("Documents", StorageUtils.getCategoryForFile("report.pdf", "application/pdf"))
     assertEquals("Other", StorageUtils.getCategoryForFile("archive.bin", "application/octet-stream"))
   }
+
+  @Test
+  fun `test device role values`() {
+    assertEquals("HOST", com.example.models.DeviceRole.HOST.name)
+    assertEquals("ADMIN", com.example.models.DeviceRole.ADMIN.name)
+  }
 }

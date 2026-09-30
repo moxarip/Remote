@@ -111,9 +111,16 @@ class BackupRepository(private val context: Context) {
         _activePairingCode.value = null
     }
 
-    fun setDeviceRole(role: DeviceRole) {
+    suspend fun setDeviceRole(role: DeviceRole) {
         val user = _currentUser.value ?: return
-        _currentUser.value = user.copy(selectedRole = role)
+        _currentUser.value = user.copy(selectedRole = role, role = role)
+
+        // Store role preference in Firebase Realtime Database
+        FirebaseManager.saveRolePreference(
+            userId = user.userId,
+            deviceId = localDeviceId,
+            role = role
+        )
 
         if (role == DeviceRole.HOST) {
             val (freeBytes, totalBytes) = StorageUtils.getStorageStats()
@@ -135,6 +142,17 @@ class BackupRepository(private val context: Context) {
 
             // Auto initial scan for demonstration
             scanLocalVault()
+        } else {
+            // Register or update Admin device entry in Firebase RTDB
+            val adminDevice = HostDevice(
+                deviceId = localDeviceId,
+                userId = user.userId,
+                name = localDeviceName,
+                role = DeviceRole.ADMIN.name,
+                status = "ONLINE",
+                lastSeen = System.currentTimeMillis()
+            )
+            FirebaseManager.registerOrUpdateDevice(adminDevice)
         }
     }
 

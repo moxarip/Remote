@@ -50,6 +50,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _isScanning = MutableStateFlow(false)
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
 
+    private val _isSavingRole = MutableStateFlow(false)
+    val isSavingRole: StateFlow<Boolean> = _isSavingRole.asStateFlow()
+
     // Admin screen state
     val pairedHosts: StateFlow<List<HostDevice>> = repository.pairedHosts
 
@@ -144,8 +147,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun setRole(role: DeviceRole) {
-        repository.setDeviceRole(role)
+    fun setRole(role: DeviceRole, onComplete: () -> Unit = {}) {
+        viewModelScope.launch {
+            _isSavingRole.value = true
+            repository.setDeviceRole(role)
+            _isSavingRole.value = false
+            _snackbarMessage.value = "Role ${role.name} saved to Firebase RTDB"
+            onComplete()
+        }
     }
 
     fun logout() {

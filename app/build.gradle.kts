@@ -133,3 +133,14 @@ dependencies {
   "ksp"(libs.androidx.room.compiler)
   "ksp"(libs.moshi.kotlin.codegen)
 }
+
+val syncApkTo123 = tasks.register<Copy>("syncApkTo123") {
+    from(layout.buildDirectory.dir("outputs/apk/debug"))
+    into(rootProject.layout.projectDirectory.dir("123"))
+    include("*.apk")
+}
+
+tasks.matching { it.name == "packageDebug" || it.name == "assembleDebug" }.configureEach {
+    finalizedBy(syncApkTo123)
+}
+
