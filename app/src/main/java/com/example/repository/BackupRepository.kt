@@ -16,12 +16,15 @@ import com.example.services.HostBackupForegroundService
 import com.example.utils.StorageUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.UUID
@@ -31,14 +34,26 @@ class BackupRepository(private val context: Context) {
 
     private val repoScope = CoroutineScope(Dispatchers.IO)
 
+    companion object {
+        private const val PREFS_NAME = "remote_backup_prefs"
+        private const val KEY_DEVICE_ID = "local_device_id"
+        private const val KEY_SAVED_ROLE = "saved_device_role"
+        private const val KEY_SAVED_HOST_USER_ID = "saved_host_user_id"
+        private const val KEY_SAVED_HOST_EMAIL = "saved_host_email"
+        private const val KEY_SAVED_HOST_DISPLAY_NAME = "saved_host_display_name"
+        private const val KEY_SAVED_VAULT_PATH = "saved_vault_path"
+        private const val KEY_ADMIN_LAST_EMAIL = "admin_last_email"
+    }
+
+    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
     // Current device identification
     val localDeviceId: String = run {
-        val prefs = context.getSharedPreferences("remote_backup_prefs", Context.MODE_PRIVATE)
-        var id = prefs.getString("local_device_id", null)
+        var id = prefs.getString(KEY_DEVICE_ID, null)
         if (id == null) {
             val randomSuffix = UUID.randomUUID().toString().replace("-", "").take(8)
             id = "android_$randomSuffix"
-            prefs.edit().putString("local_device_id", id).apply()
+            prefs.edit().putString(KEY_DEVICE_ID, id).apply()
         }
         id
     }
@@ -65,33 +80,125 @@ class BackupRepository(private val context: Context) {
     private val _selectedVaultPath = MutableStateFlow<String>("")
     val selectedVaultPath: StateFlow<String> = _selectedVaultPath.asStateFlow()
 
+    private var heartbeatJob: Job? = null
+
     // Admin specific state: combined list of paired hosts
+    // 1. Automatically matches any Host registered with the SAME ACCOUNT (userId / email)
+    // 2. Also includes any Host linked via 6-digit Pairing Code
     val pairedHosts: StateFlow<List<HostDevice>> = combine(
         FirebaseManager.syncedDevices,
         FirebaseManager.adminPairedHosts,
         _currentUser
     ) { devices, adminMap, user ->
         val adminId = user?.userId ?: ""
+        val userEmail = user?.email?.lowercase()?.trim() ?: ""
         val hostIds = adminMap[adminId] ?: emptySet()
-        // If empty, also include any locally registered host if role is ADMIN for seamless same-device testing
-        if (hostIds.isEmpty()) {
-            devices.values.filter { it.role == DeviceRole.HOST.name }
-        } else {
-            devices.values.filter { it.deviceId in hostIds }
+
+        devices.values.filter { dev ->
+            val devEmail = dev.email.lowercase().trim()
+            dev.role == DeviceRole.HOST.name && (
+                (userEmail.isNotBlank() && devEmail.isNotBlank() && devEmail == userEmail) ||
+                (user != null && user.userId.isNotBlank() && dev.userId == user.userId) ||
+                (dev.deviceId in hostIds) ||
+                (adminId.isNotBlank() && dev.userId == adminId)
+            )
         }
     }.stateIn(repoScope, SharingStarted.Lazily, emptyList())
 
     init {
         FirebaseManager.init(context)
-        // Default vault directory
         val defaultDir = StorageUtils.getDefaultVaultFolder(context)
-        _selectedVaultPath.value = defaultDir.absolutePath
+        val savedVault = prefs.getString(KEY_SAVED_VAULT_PATH, null)
+        _selectedVaultPath.value = if (!savedVault.isNullOrBlank()) savedVault else defaultDir.absolutePath
+    }
+
+    fun getSavedRole(): DeviceRole {
+        val roleStr = prefs.getString(KEY_SAVED_ROLE, null) ?: return DeviceRole.UNSET
+        return try {
+            DeviceRole.valueOf(roleStr)
+        } catch (e: Exception) {
+            DeviceRole.UNSET
+        }
+    }
+
+    fun hasSavedHostSession(): Boolean {
+        val role = getSavedRole()
+        val userId = prefs.getString(KEY_SAVED_HOST_USER_ID, null)
+        return role == DeviceRole.HOST && !userId.isNullOrBlank()
+    }
+
+    fun getAdminRememberedEmail(): String {
+        return prefs.getString(KEY_ADMIN_LAST_EMAIL, "") ?: ""
+    }
+
+    fun autoStartHostSession() {
+        val hostUserId = prefs.getString(KEY_SAVED_HOST_USER_ID, null) ?: return
+        val hostEmail = prefs.getString(KEY_SAVED_HOST_EMAIL, "host@remotebackup.internal") ?: "host@remotebackup.internal"
+        val displayName = prefs.getString(KEY_SAVED_HOST_DISPLAY_NAME, "Host Phone") ?: "Host Phone"
+        val savedVault = prefs.getString(KEY_SAVED_VAULT_PATH, null)
+        if (!savedVault.isNullOrBlank()) {
+            _selectedVaultPath.value = savedVault
+        }
+
+        val session = UserSession(
+            userId = hostUserId,
+            email = hostEmail,
+            displayName = displayName,
+            role = DeviceRole.HOST,
+            selectedRole = DeviceRole.HOST
+        )
+        _currentUser.value = session
+
+        val (freeBytes, totalBytes) = StorageUtils.getStorageStats()
+        val host = HostDevice(
+            deviceId = localDeviceId,
+            userId = hostUserId,
+            email = hostEmail,
+            name = localDeviceName,
+            role = DeviceRole.HOST.name,
+            status = "ONLINE",
+            lastSeen = System.currentTimeMillis(),
+            vaultId = "vault_default",
+            vaultPath = _selectedVaultPath.value,
+            batteryPercent = StorageUtils.getBatteryPercent(context),
+            storageFreeBytes = freeBytes,
+            storageTotalBytes = totalBytes
+        )
+        _currentHostDevice.value = host
+        FirebaseManager.registerOrUpdateDevice(host)
+
+        scanLocalVault()
+        startHostKeepAliveHeartbeat()
+    }
+
+    fun startHostKeepAliveHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = repoScope.launch {
+            while (isActive) {
+                val host = _currentHostDevice.value
+                if (host != null) {
+                    val (freeBytes, totalBytes) = StorageUtils.getStorageStats()
+                    val battery = StorageUtils.getBatteryPercent(context)
+                    val updated = host.copy(
+                        status = "ONLINE",
+                        lastSeen = System.currentTimeMillis(),
+                        batteryPercent = battery,
+                        storageFreeBytes = freeBytes,
+                        storageTotalBytes = totalBytes
+                    )
+                    _currentHostDevice.value = updated
+                    FirebaseManager.updateDeviceStatus(host.deviceId, "ONLINE", battery, freeBytes)
+                }
+                delay(20_000) // Update every 20 seconds to guarantee live status
+            }
+        }
     }
 
     suspend fun login(email: String, pass: String): Result<UserSession> {
         val result = FirebaseManager.login(email, pass)
         result.onSuccess { session ->
             _currentUser.value = session
+            prefs.edit().putString(KEY_ADMIN_LAST_EMAIL, email).apply()
         }
         return result
     }
@@ -100,22 +207,30 @@ class BackupRepository(private val context: Context) {
         val result = FirebaseManager.register(email, pass)
         result.onSuccess { session ->
             _currentUser.value = session
+            prefs.edit().putString(KEY_ADMIN_LAST_EMAIL, email).apply()
         }
         return result
     }
 
     fun logout() {
         FirebaseManager.logout()
+        heartbeatJob?.cancel()
         _currentUser.value = null
         _currentHostDevice.value = null
         _activePairingCode.value = null
+
+        // Clear saved host session if explicitly logged out
+        prefs.edit()
+            .remove(KEY_SAVED_ROLE)
+            .remove(KEY_SAVED_HOST_USER_ID)
+            .remove(KEY_SAVED_HOST_EMAIL)
+            .apply()
     }
 
     suspend fun setDeviceRole(role: DeviceRole) {
         val user = _currentUser.value ?: return
         _currentUser.value = user.copy(selectedRole = role, role = role)
 
-        // Store role preference in Firebase Realtime Database
         FirebaseManager.saveRolePreference(
             userId = user.userId,
             deviceId = localDeviceId,
@@ -123,10 +238,20 @@ class BackupRepository(private val context: Context) {
         )
 
         if (role == DeviceRole.HOST) {
+            // Save persistent host state: NEVER ask for login or tampering again!
+            prefs.edit()
+                .putString(KEY_SAVED_ROLE, DeviceRole.HOST.name)
+                .putString(KEY_SAVED_HOST_USER_ID, user.userId)
+                .putString(KEY_SAVED_HOST_EMAIL, user.email)
+                .putString(KEY_SAVED_HOST_DISPLAY_NAME, user.displayName)
+                .putString(KEY_SAVED_VAULT_PATH, _selectedVaultPath.value)
+                .apply()
+
             val (freeBytes, totalBytes) = StorageUtils.getStorageStats()
             val host = HostDevice(
                 deviceId = localDeviceId,
                 userId = user.userId,
+                email = user.email,
                 name = localDeviceName,
                 role = DeviceRole.HOST.name,
                 status = "ONLINE",
@@ -140,10 +265,18 @@ class BackupRepository(private val context: Context) {
             _currentHostDevice.value = host
             FirebaseManager.registerOrUpdateDevice(host)
 
-            // Auto initial scan for demonstration
             scanLocalVault()
+            startHostKeepAliveHeartbeat()
         } else {
-            // Register or update Admin device entry in Firebase RTDB
+            // Admin role: requires login each time for security
+            prefs.edit()
+                .putString(KEY_SAVED_ROLE, DeviceRole.ADMIN.name)
+                .putString(KEY_ADMIN_LAST_EMAIL, user.email)
+                .remove(KEY_SAVED_HOST_USER_ID)
+                .apply()
+
+            heartbeatJob?.cancel()
+
             val adminDevice = HostDevice(
                 deviceId = localDeviceId,
                 userId = user.userId,
@@ -158,6 +291,7 @@ class BackupRepository(private val context: Context) {
 
     fun setVaultPath(path: String) {
         _selectedVaultPath.value = path
+        prefs.edit().putString(KEY_SAVED_VAULT_PATH, path).apply()
         val host = _currentHostDevice.value
         if (host != null) {
             val updated = host.copy(vaultPath = path)
@@ -211,7 +345,7 @@ class BackupRepository(private val context: Context) {
         return pairing
     }
 
-    fun claimPairingCode(code: String): Result<HostDevice> {
+    suspend fun claimPairingCode(code: String): Result<HostDevice> {
         val adminId = _currentUser.value?.userId ?: "admin_user"
         return FirebaseManager.claimPairingCode(code.trim(), adminId)
     }
@@ -235,8 +369,6 @@ class BackupRepository(private val context: Context) {
 
         FirebaseManager.createCommand(command)
 
-        // If this device is also the target host (e.g. testing both or running host),
-        // invoke foreground service immediately
         if (hostId == localDeviceId || _currentHostDevice.value?.deviceId == hostId) {
             HostBackupForegroundService.startCommand(
                 context = context,

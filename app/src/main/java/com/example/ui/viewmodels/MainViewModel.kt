@@ -23,8 +23,8 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 data class AuthUiState(
-    val email: String = "admin@example.com",
-    val password: String = "password123",
+    val email: String = "semailbibi42@gmail.com",
+    val password: String = "",
     val isRegisterMode: Boolean = false,
     val isLoading: Boolean = false,
     val errorMessage: String? = null
@@ -107,6 +107,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             it.status == CommandStatus.RUNNING.name || it.status == CommandStatus.PENDING.name
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    init {
+        val rememberedEmail = repository.getAdminRememberedEmail()
+        if (rememberedEmail.isNotBlank()) {
+            _authUiState.value = _authUiState.value.copy(email = rememberedEmail)
+        }
+    }
+
+    fun restoreHostSession() {
+        repository.autoStartHostSession()
+    }
+
+    fun refreshDevices() {
+        viewModelScope.launch {
+            com.example.firebase.FirebaseManager.refreshDevicesFromCloud()
+        }
+    }
 
     fun onEmailChanged(email: String) {
         _authUiState.value = _authUiState.value.copy(email = email, errorMessage = null)
@@ -216,17 +233,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        val result = repository.claimPairingCode(code)
-        result.fold(
-            onSuccess = { host ->
-                _pairingDialogVisible.value = false
-                _selectedHost.value = host
-                _snackbarMessage.value = "Paired successfully with ${host.name}"
-            },
-            onFailure = { error ->
-                _pairingError.value = error.message ?: "Failed to pair host"
-            }
-        )
+        viewModelScope.launch {
+            val result = repository.claimPairingCode(code)
+            result.fold(
+                onSuccess = { host ->
+                    _pairingDialogVisible.value = false
+                    _selectedHost.value = host
+                    _snackbarMessage.value = "Paired successfully with ${host.name}"
+                },
+                onFailure = { error ->
+                    _pairingError.value = error.message ?: "Failed to pair host"
+                }
+            )
+        }
     }
 
     fun toggleFileSelection(fileId: String) {

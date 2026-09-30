@@ -25,6 +25,7 @@ enum class CommandStatus {
 data class HostDevice(
     val deviceId: String = "",
     val userId: String = "",
+    val email: String = "",
     val name: String = "",
     val role: String = DeviceRole.HOST.name,
     val status: String = "ONLINE",

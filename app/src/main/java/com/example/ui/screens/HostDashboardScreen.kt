@@ -163,6 +163,45 @@ fun HostDashboardScreen(
                 .padding(innerPadding)
                 .padding(horizontal = 20.dp)
         ) {
+            // UNATTENDED HOME HOST BANNER
+            item {
+                Surface(
+                    color = EmeraldOnline.copy(alpha = 0.12f),
+                    shape = RoundedCornerShape(14.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, EmeraldOnline.copy(alpha = 0.35f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 14.dp)
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = null,
+                                tint = EmeraldOnline,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "UNATTENDED HOME HOST ACTIVE",
+                                color = EmeraldOnline,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace,
+                                letterSpacing = 1.sp
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "هذا الهاتف يعمل في وضع الهوست المنزلي الدائم. يمكنك تركه في المنزل والاتصال به من هاتف الآدمين للحصول على الملفات في أي وقت دون الحاجة للمس هذا الهاتف مجدداً.",
+                            color = TextPrimary,
+                            fontSize = 12.sp,
+                            lineHeight = 17.sp
+                        )
+                    }
+                }
+            }
+
             // Device ID pill
             item {
                 Surface(

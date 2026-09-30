@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Storage
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -57,6 +58,7 @@ import com.example.ui.components.BatteryBadge
 import com.example.ui.components.StatusBadge
 import com.example.ui.theme.CyanAccent
 import com.example.ui.theme.ElectricBlue
+import com.example.ui.theme.EmeraldOnline
 import com.example.ui.theme.RoseError
 import com.example.ui.theme.SlateBorder
 import com.example.ui.theme.SlateCard
@@ -73,6 +75,7 @@ fun AdminDashboardScreen(
     showAddDialog: Boolean,
     pairingCodeInput: String,
     pairingError: String?,
+    currentUserEmail: String = "",
     onOpenAddDialog: () -> Unit,
     onCloseAddDialog: () -> Unit,
     onPairingCodeChanged: (String) -> Unit,
@@ -126,7 +129,7 @@ fun AdminDashboardScreen(
                 contentColor = SlateDark,
                 shape = RoundedCornerShape(16.dp),
                 icon = { Icon(Icons.Default.Add, contentDescription = "Add Host") },
-                text = { Text("ADD HOST", fontWeight = FontWeight.Bold) },
+                text = { Text("PAIR CODE", fontWeight = FontWeight.Bold) },
                 modifier = Modifier.testTag("add_host_fab")
             )
         }
@@ -137,11 +140,56 @@ fun AdminDashboardScreen(
                 .padding(innerPadding)
                 .padding(horizontal = 20.dp)
         ) {
+            // Account Auto-Discovery Banner
+            item {
+                Surface(
+                    color = SlateCard,
+                    shape = RoundedCornerShape(14.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, SlateBorder),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 16.dp)
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(EmeraldOnline)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Account Sync Active",
+                                color = EmeraldOnline,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = if (currentUserEmail.isNotBlank()) "Signed in: $currentUserEmail" else "Signed in with Remote Backup Account",
+                            color = TextPrimary,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Any Host phone logged into this account appears automatically below. Tap 'CONNECT' to access files anytime without touching the home phone.",
+                            color = TextSecondary,
+                            fontSize = 12.sp,
+                            lineHeight = 16.sp
+                        )
+                    }
+                }
+            }
+
             item {
                 Text(
-                    text = "Paired Android Devices (${hosts.size})",
+                    text = "Connected Hosts (${hosts.size})",
                     color = TextSecondary,
                     fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
                     modifier = Modifier.padding(bottom = 12.dp)
                 )
             }
@@ -357,25 +405,26 @@ fun HostCardItem(
 
             Button(
                 onClick = onOpenHost,
-                colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue.copy(alpha = 0.15f)),
-                shape = RoundedCornerShape(10.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue),
+                shape = RoundedCornerShape(12.dp),
                 modifier = Modifier
                     .fillMaxWidth()
+                    .height(48.dp)
                     .testTag("open_host_button_${host.deviceId}")
             ) {
-                Text(
-                    text = "OPEN HOST",
-                    color = ElectricBlue,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp,
-                    letterSpacing = 1.sp
-                )
-                Spacer(modifier = Modifier.width(6.dp))
                 Icon(
-                    imageVector = Icons.Default.ArrowForward,
-                    contentDescription = "Open",
-                    tint = ElectricBlue,
-                    modifier = Modifier.size(16.dp)
+                    imageVector = Icons.Default.Sync,
+                    contentDescription = "Connect",
+                    tint = SlateDark,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "CONNECT / اتصال بالهاتف",
+                    color = SlateDark,
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize = 13.sp,
+                    letterSpacing = 0.5.sp
                 )
             }
         }

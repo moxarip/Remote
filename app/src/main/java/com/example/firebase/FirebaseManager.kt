@@ -4,26 +4,32 @@ import android.content.Context
 import android.util.Log
 import com.example.models.BackupCommand
 import com.example.models.CommandStatus
+import com.example.models.CommandType
+import com.example.models.DeviceRole
 import com.example.models.HostDevice
 import com.example.models.PairingCodeData
 import com.example.models.UserSession
 import com.example.models.VaultFile
 import com.example.models.VaultSummary
-import com.google.firebase.FirebaseApp
-import com.google.firebase.auth.FirebaseAuth
-import com.google.firebase.database.DataSnapshot
-import com.google.firebase.database.DatabaseError
-import com.google.firebase.database.DatabaseReference
-import com.google.firebase.database.FirebaseDatabase
-import com.google.firebase.database.ValueEventListener
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.UUID
+import java.util.concurrent.TimeUnit
+import kotlin.random.Random
 
 object FirebaseManager {
 
@@ -31,11 +37,18 @@ object FirebaseManager {
     const val DEFAULT_PROJECT_ID = "remote-backup-d1ee0"
     const val DEFAULT_DATABASE_URL = "https://remote-backup-d1ee0-default-rtdb.firebaseio.com"
 
-    private var firebaseAuth: FirebaseAuth? = null
-    private var databaseRef: DatabaseReference? = null
-    private var isFirebaseInitialized = false
+    private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
-    // In-memory synced state for resilient local operation & real-time testing
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .build()
+
+    private val scope = CoroutineScope(Dispatchers.IO)
+    private var syncJob: Job? = null
+
+    // In-memory synced state
     private val _syncedDevices = MutableStateFlow<Map<String, HostDevice>>(emptyMap())
     val syncedDevices: StateFlow<Map<String, HostDevice>> = _syncedDevices.asStateFlow()
 
@@ -52,174 +65,324 @@ object FirebaseManager {
     private val _adminPairedHosts = MutableStateFlow<Map<String, Set<String>>>(emptyMap())
     val adminPairedHosts: StateFlow<Map<String, Set<String>>> = _adminPairedHosts.asStateFlow()
 
+    fun sanitizeEmail(email: String): String {
+        return email.lowercase().trim().replace(".", "_").replace("@", "_at_")
+    }
+
     fun init(context: Context) {
+        Log.d(TAG, "Initializing FirebaseManager directly with RTDB: $DEFAULT_DATABASE_URL")
+        startBackgroundCloudSync()
+    }
+
+    private fun startBackgroundCloudSync() {
+        syncJob?.cancel()
+        syncJob = scope.launch {
+            while (isActive) {
+                try {
+                    refreshDevicesFromCloudInternal()
+                    refreshPairingsFromCloudInternal()
+                    refreshCommandsFromCloudInternal()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Background cloud sync error: ${e.message}")
+                }
+                delay(4000) // Poll every 4 seconds for instantaneous multi-device updates
+            }
+        }
+    }
+
+    // --- Authentication via Firebase Realtime Database Accounts ---
+    suspend fun login(email: String, pass: String): Result<UserSession> = withContext(Dispatchers.IO) {
+        val cleanEmail = email.trim().lowercase()
+        val emailKey = sanitizeEmail(cleanEmail)
+
+        if (cleanEmail.isBlank()) {
+            return@withContext Result.failure(Exception("يرجى إدخال البريد الإلكتروني"))
+        }
+        if (pass.isBlank()) {
+            return@withContext Result.failure(Exception("يرجى إدخال كلمة المرور"))
+        }
+
         try {
-            if (FirebaseApp.getApps(context).isNotEmpty()) {
-                firebaseAuth = FirebaseAuth.getInstance()
-                databaseRef = FirebaseDatabase.getInstance(DEFAULT_DATABASE_URL).reference
-                isFirebaseInitialized = true
-                Log.d(TAG, "Firebase initialized successfully with project $DEFAULT_PROJECT_ID")
-            } else {
-                Log.w(TAG, "No default FirebaseApp configured; operating in resilient sync mode")
+            val url = "$DEFAULT_DATABASE_URL/accounts/$emailKey.json"
+            val request = Request.Builder().url(url).get().build()
+            val response = httpClient.newCall(request).execute()
+
+            if (!response.isSuccessful) {
+                return@withContext Result.failure(Exception("تعذر الاتصال بـ Firebase (${response.code})"))
             }
+
+            val body = response.body?.string()?.trim() ?: "null"
+            if (body == "null" || body.isEmpty()) {
+                // Strict check: DO NOT accept random accounts!
+                return@withContext Result.failure(
+                    Exception("هذا البريد الإلكتروني غير مسجل في Firebase.\nيرجى الضغط على 'إنشاء حساب جديد' والتسجيل أولاً.")
+                )
+            }
+
+            val json = JSONObject(body)
+            val storedPassword = json.optString("password", "")
+
+            if (storedPassword != pass) {
+                return@withContext Result.failure(Exception("كلمة المرور غير صحيحة. يرجى التأكد من كلمة المرور."))
+            }
+
+            val userId = json.optString("userId", "usr_${UUID.nameUUIDFromBytes(cleanEmail.toByteArray())}")
+            val displayName = json.optString("displayName", cleanEmail.substringBefore('@'))
+            val roleStr = json.optString("role", "")
+            val selectedRole = try {
+                if (roleStr.isNotBlank()) DeviceRole.valueOf(roleStr) else DeviceRole.UNSET
+            } catch (e: Exception) {
+                DeviceRole.UNSET
+            }
+
+            val session = UserSession(
+                userId = userId,
+                email = cleanEmail,
+                displayName = displayName,
+                role = selectedRole,
+                selectedRole = selectedRole
+            )
+
+            // Update user lastSeen in Firebase RTDB
+            val patchJson = JSONObject().apply {
+                put("lastSeen", System.currentTimeMillis())
+            }
+            val patchReq = Request.Builder()
+                .url("$DEFAULT_DATABASE_URL/accounts/$emailKey.json")
+                .patch(patchJson.toString().toRequestBody(jsonMediaType))
+                .build()
+            httpClient.newCall(patchReq).execute()
+
+            Result.success(session)
         } catch (e: Exception) {
-            Log.e(TAG, "Firebase init fallback to local synchronization engine: ${e.message}")
-            isFirebaseInitialized = false
+            Log.e(TAG, "Login exception: ${e.message}")
+            Result.failure(Exception("خطأ في الاتصال بـ Firebase: ${e.message}"))
         }
     }
 
-    fun isConnectedToCloud(): Boolean = isFirebaseInitialized
+    suspend fun register(email: String, pass: String): Result<UserSession> = withContext(Dispatchers.IO) {
+        val cleanEmail = email.trim().lowercase()
+        val emailKey = sanitizeEmail(cleanEmail)
 
-    // --- Authentication ---
-    suspend fun login(email: String, pass: String): Result<UserSession> {
-        return try {
-            if (isFirebaseInitialized && firebaseAuth != null) {
-                val authResult = firebaseAuth!!.signInWithEmailAndPassword(email, pass).await()
-                val user = authResult.user
-                val session = UserSession(
-                    userId = user?.uid ?: UUID.randomUUID().toString(),
-                    email = user?.email ?: email,
-                    displayName = user?.displayName ?: email.substringBefore('@')
-                )
-                Result.success(session)
-            } else {
-                // Resilient local auth
-                val session = UserSession(
-                    userId = "user_${UUID.nameUUIDFromBytes(email.toByteArray())}",
-                    email = email,
-                    displayName = email.substringBefore('@')
-                )
-                Result.success(session)
-            }
-        } catch (e: Exception) {
-            // If Firebase throws invalid credentials or no connection, return helpful result
-            if (email.isNotBlank() && pass.length >= 6) {
-                // Allow fallback login so the tester isn't blocked by network credentials
-                Result.success(
-                    UserSession(
-                        userId = "user_${UUID.nameUUIDFromBytes(email.toByteArray())}",
-                        email = email,
-                        displayName = email.substringBefore('@')
-                    )
-                )
-            } else {
-                Result.failure(e)
-            }
+        if (cleanEmail.isBlank() || !cleanEmail.contains("@")) {
+            return@withContext Result.failure(Exception("يرجى إدخال بريد إلكتروني صالح"))
         }
-    }
+        if (pass.length < 6) {
+            return@withContext Result.failure(Exception("يجب أن تكون كلمة المرور 6 أحرف أو أرقام على الأقل"))
+        }
 
-    suspend fun register(email: String, pass: String): Result<UserSession> {
-        return try {
-            if (isFirebaseInitialized && firebaseAuth != null) {
-                val authResult = firebaseAuth!!.createUserWithEmailAndPassword(email, pass).await()
-                val user = authResult.user
-                val session = UserSession(
-                    userId = user?.uid ?: UUID.randomUUID().toString(),
-                    email = user?.email ?: email,
-                    displayName = email.substringBefore('@')
-                )
-                Result.success(session)
-            } else {
-                val session = UserSession(
-                    userId = "user_${UUID.nameUUIDFromBytes(email.toByteArray())}",
-                    email = email,
-                    displayName = email.substringBefore('@')
-                )
-                Result.success(session)
+        try {
+            // Check if already registered
+            val checkUrl = "$DEFAULT_DATABASE_URL/accounts/$emailKey.json"
+            val checkReq = Request.Builder().url(checkUrl).get().build()
+            val checkResp = httpClient.newCall(checkReq).execute()
+            val existingBody = checkResp.body?.string()?.trim() ?: "null"
+
+            if (existingBody != "null" && existingBody.isNotEmpty() && existingBody != "{}") {
+                return@withContext Result.failure(Exception("هذا البريد مسجل مسبقاً في Firebase. يرجى تسجيل الدخول."))
             }
+
+            val userId = "usr_${System.currentTimeMillis()}_${Random.nextInt(1000, 9999)}"
+            val displayName = cleanEmail.substringBefore('@')
+
+            val accountJson = JSONObject().apply {
+                put("userId", userId)
+                put("email", cleanEmail)
+                put("password", pass)
+                put("displayName", displayName)
+                put("createdAt", System.currentTimeMillis())
+                put("lastSeen", System.currentTimeMillis())
+            }
+
+            val putReq = Request.Builder()
+                .url("$DEFAULT_DATABASE_URL/accounts/$emailKey.json")
+                .put(accountJson.toString().toRequestBody(jsonMediaType))
+                .build()
+            val putResp = httpClient.newCall(putReq).execute()
+
+            if (!putResp.isSuccessful) {
+                return@withContext Result.failure(Exception("فشل إنشاء الحساب في Firebase (${putResp.code})"))
+            }
+
+            // Also create user record
+            val userRecord = JSONObject().apply {
+                put("displayId", displayName)
+                put("email", cleanEmail)
+                put("lastSeen", System.currentTimeMillis())
+            }
+            val userReq = Request.Builder()
+                .url("$DEFAULT_DATABASE_URL/users/$userId.json")
+                .put(userRecord.toString().toRequestBody(jsonMediaType))
+                .build()
+            httpClient.newCall(userReq).execute()
+
+            val session = UserSession(
+                userId = userId,
+                email = cleanEmail,
+                displayName = displayName,
+                role = DeviceRole.UNSET,
+                selectedRole = DeviceRole.UNSET
+            )
+            Result.success(session)
         } catch (e: Exception) {
-            if (email.isNotBlank() && pass.length >= 6) {
-                Result.success(
-                    UserSession(
-                        userId = "user_${UUID.nameUUIDFromBytes(email.toByteArray())}",
-                        email = email,
-                        displayName = email.substringBefore('@')
-                    )
-                )
-            } else {
-                Result.failure(e)
-            }
+            Log.e(TAG, "Register exception: ${e.message}")
+            Result.failure(Exception("خطأ في تسجيل الحساب: ${e.message}"))
         }
     }
 
     fun logout() {
-        try {
-            firebaseAuth?.signOut()
-        } catch (e: Exception) {
-            Log.e(TAG, "Logout error: ${e.message}")
-        }
+        // Clear local state
+        Log.d(TAG, "User logged out")
     }
 
-    suspend fun saveRolePreference(
-        userId: String,
-        deviceId: String,
-        role: com.example.models.DeviceRole
-    ): Result<Unit> {
-        return try {
-            // Update in-memory state
-            val current = _syncedDevices.value.toMutableMap()
-            val existing = current[deviceId]
-            if (existing != null) {
-                current[deviceId] = existing.copy(role = role.name)
-                _syncedDevices.value = current
+    suspend fun saveRolePreference(userId: String, deviceId: String, role: DeviceRole): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val roleJson = JSONObject().apply {
+                put("role", role.name)
+                put("updatedAt", System.currentTimeMillis())
             }
-
-            if (isFirebaseInitialized && databaseRef != null) {
-                if (userId.isNotBlank()) {
-                    databaseRef!!.child("users").child(userId).child("role").setValue(role.name).await()
-                    databaseRef!!.child("users").child(userId).child("updatedAt").setValue(System.currentTimeMillis()).await()
-                }
-                if (deviceId.isNotBlank()) {
-                    databaseRef!!.child("devices").child(deviceId).child("role").setValue(role.name).await()
-                    databaseRef!!.child("devices").child(deviceId).child("updatedAt").setValue(System.currentTimeMillis()).await()
-                }
-                Log.d(TAG, "Successfully persisted role ${role.name} to Firebase RTDB for user $userId and device $deviceId")
-            } else {
-                Log.d(TAG, "Saved role ${role.name} to local synchronization engine")
+            if (userId.isNotBlank()) {
+                val req = Request.Builder()
+                    .url("$DEFAULT_DATABASE_URL/users/$userId.json")
+                    .patch(roleJson.toString().toRequestBody(jsonMediaType))
+                    .build()
+                httpClient.newCall(req).execute()
             }
+            if (deviceId.isNotBlank()) {
+                val req = Request.Builder()
+                    .url("$DEFAULT_DATABASE_URL/devices/$deviceId.json")
+                    .patch(roleJson.toString().toRequestBody(jsonMediaType))
+                    .build()
+                httpClient.newCall(req).execute()
+            }
+            refreshDevicesFromCloudInternal()
             Result.success(Unit)
         } catch (e: Exception) {
-            Log.e(TAG, "Error saving role preference to Firebase: ${e.message}")
-            Result.success(Unit) // Return success with fallback to avoid blocking user flow
+            Log.e(TAG, "Error saving role to RTDB: ${e.message}")
+            Result.success(Unit)
         }
     }
 
-    // --- Device Management ---
+    // --- Device Management in Realtime Database ---
     fun registerOrUpdateDevice(device: HostDevice) {
         val current = _syncedDevices.value.toMutableMap()
         current[device.deviceId] = device
         _syncedDevices.value = current
 
-        if (isFirebaseInitialized && databaseRef != null) {
+        scope.launch {
             try {
-                databaseRef!!.child("devices").child(device.deviceId).setValue(device)
+                val json = JSONObject().apply {
+                    put("deviceId", device.deviceId)
+                    put("userId", device.userId)
+                    put("email", device.email)
+                    put("ownerUid", device.userId)
+                    put("name", device.name)
+                    put("role", device.role)
+                    put("status", device.status)
+                    put("online", device.status.equals("ONLINE", ignoreCase = true))
+                    put("app", "Remote Backup Vault")
+                    put("batteryPercent", device.batteryPercent)
+                    put("storageFreeBytes", device.storageFreeBytes)
+                    put("storageTotalBytes", device.storageTotalBytes)
+                    put("fileCount", device.fileCount)
+                    put("folderCount", device.folderCount)
+                    put("vaultSizeBytes", device.vaultSizeBytes)
+                    put("vaultPath", device.vaultPath)
+                    put("lastScan", device.lastScan)
+                    put("lastSeen", System.currentTimeMillis())
+                }
+
+                val req = Request.Builder()
+                    .url("$DEFAULT_DATABASE_URL/devices/${device.deviceId}.json")
+                    .put(json.toString().toRequestBody(jsonMediaType))
+                    .build()
+                httpClient.newCall(req).execute()
+                Log.d(TAG, "Updated device ${device.deviceId} in Firebase RTDB")
             } catch (e: Exception) {
-                Log.e(TAG, "RTDB error updating device: ${e.message}")
+                Log.e(TAG, "Error updating device in RTDB: ${e.message}")
             }
         }
     }
 
     fun updateDeviceStatus(deviceId: String, status: String, battery: Int, freeStorage: Long) {
         val current = _syncedDevices.value.toMutableMap()
-        val dev = current[deviceId] ?: return
-        val updated = dev.copy(
-            status = status,
-            batteryPercent = battery,
-            storageFreeBytes = freeStorage,
-            lastSeen = System.currentTimeMillis()
-        )
-        current[deviceId] = updated
-        _syncedDevices.value = current
+        val dev = current[deviceId]
+        if (dev != null) {
+            current[deviceId] = dev.copy(
+                status = status,
+                batteryPercent = battery,
+                storageFreeBytes = freeStorage,
+                lastSeen = System.currentTimeMillis()
+            )
+            _syncedDevices.value = current
+        }
 
-        if (isFirebaseInitialized && databaseRef != null) {
+        scope.launch {
             try {
-                databaseRef!!.child("devices").child(deviceId).child("status").setValue(status)
-                databaseRef!!.child("devices").child(deviceId).child("batteryPercent").setValue(battery)
-                databaseRef!!.child("devices").child(deviceId).child("storageFreeBytes").setValue(freeStorage)
-                databaseRef!!.child("devices").child(deviceId).child("lastSeen").setValue(System.currentTimeMillis())
+                val json = JSONObject().apply {
+                    put("status", status)
+                    put("online", status.equals("ONLINE", ignoreCase = true))
+                    put("batteryPercent", battery)
+                    put("storageFreeBytes", freeStorage)
+                    put("lastSeen", System.currentTimeMillis())
+                }
+                val req = Request.Builder()
+                    .url("$DEFAULT_DATABASE_URL/devices/$deviceId.json")
+                    .patch(json.toString().toRequestBody(jsonMediaType))
+                    .build()
+                httpClient.newCall(req).execute()
             } catch (e: Exception) {
-                Log.e(TAG, "RTDB update status error: ${e.message}")
+                Log.e(TAG, "Error updating status in RTDB: ${e.message}")
             }
+        }
+    }
+
+    suspend fun refreshDevicesFromCloud() = withContext(Dispatchers.IO) {
+        refreshDevicesFromCloudInternal()
+    }
+
+    private fun refreshDevicesFromCloudInternal() {
+        try {
+            val req = Request.Builder().url("$DEFAULT_DATABASE_URL/devices.json").get().build()
+            val resp = httpClient.newCall(req).execute()
+            if (!resp.isSuccessful) return
+
+            val body = resp.body?.string()?.trim() ?: "null"
+            if (body == "null" || body.isEmpty() || body == "{}") return
+
+            val json = JSONObject(body)
+            val map = _syncedDevices.value.toMutableMap()
+
+            val keys = json.keys()
+            while (keys.hasNext()) {
+                val devId = keys.next()
+                val devObj = json.optJSONObject(devId) ?: continue
+
+                val role = devObj.optString("role", DeviceRole.HOST.name)
+                val status = if (devObj.optBoolean("online", false)) "ONLINE" else devObj.optString("status", "ONLINE")
+
+                val hostDevice = HostDevice(
+                    deviceId = devId,
+                    userId = devObj.optString("userId", devObj.optString("ownerUid", "")),
+                    email = devObj.optString("email", ""),
+                    name = devObj.optString("name", devObj.optString("app", "Android Host")),
+                    role = role,
+                    status = status,
+                    lastSeen = devObj.optLong("lastSeen", System.currentTimeMillis()),
+                    vaultPath = devObj.optString("vaultPath", ""),
+                    batteryPercent = devObj.optInt("batteryPercent", 90),
+                    storageFreeBytes = devObj.optLong("storageFreeBytes", 0L),
+                    storageTotalBytes = devObj.optLong("storageTotalBytes", 0L),
+                    fileCount = devObj.optInt("fileCount", 0),
+                    folderCount = devObj.optInt("folderCount", 0),
+                    vaultSizeBytes = devObj.optLong("vaultSizeBytes", 0L),
+                    lastScan = devObj.optLong("lastScan", 0L)
+                )
+                map[devId] = hostDevice
+            }
+            _syncedDevices.value = map
+        } catch (e: Exception) {
+            Log.e(TAG, "Error refreshing devices: ${e.message}")
         }
     }
 
@@ -229,33 +392,84 @@ object FirebaseManager {
         filesMap[deviceId] = files
         _syncedFiles.value = filesMap
 
-        val devMap = _syncedDevices.value.toMutableMap()
-        val dev = devMap[deviceId]
-        if (dev != null) {
-            devMap[deviceId] = dev.copy(
-                fileCount = summary.filesFound,
-                folderCount = summary.foldersFound,
-                vaultSizeBytes = summary.totalSizeBytes,
-                lastScan = summary.lastScanTime,
-                vaultPath = summary.vaultPath
-            )
-            _syncedDevices.value = devMap
-        }
-
-        if (isFirebaseInitialized && databaseRef != null) {
+        scope.launch {
             try {
-                val filesRef = databaseRef!!.child("devices").child(deviceId).child("files")
-                filesRef.setValue(files)
+                val filesArray = JSONArray()
+                for (f in files) {
+                    val fileObj = JSONObject().apply {
+                        put("fileId", f.fileId)
+                        put("name", f.name)
+                        put("relativePath", f.relativePath)
+                        put("size", f.size)
+                        put("mimeType", f.mimeType)
+                        put("category", f.category)
+                        put("lastModified", f.lastModified)
+                        put("createdAt", f.createdAt)
+                        put("hostDeviceId", f.hostDeviceId)
+                        put("vaultId", f.vaultId)
+                    }
+                    filesArray.put(fileObj)
+                }
 
-                val deviceRef = databaseRef!!.child("devices").child(deviceId)
-                deviceRef.child("fileCount").setValue(summary.filesFound)
-                deviceRef.child("folderCount").setValue(summary.foldersFound)
-                deviceRef.child("vaultSizeBytes").setValue(summary.totalSizeBytes)
-                deviceRef.child("lastScan").setValue(summary.lastScanTime)
-                deviceRef.child("vaultPath").setValue(summary.vaultPath)
+                val putFilesReq = Request.Builder()
+                    .url("$DEFAULT_DATABASE_URL/devices/$deviceId/files.json")
+                    .put(filesArray.toString().toRequestBody(jsonMediaType))
+                    .build()
+                httpClient.newCall(putFilesReq).execute()
+
+                val patchDev = JSONObject().apply {
+                    put("fileCount", summary.filesFound)
+                    put("folderCount", summary.foldersFound)
+                    put("vaultSizeBytes", summary.totalSizeBytes)
+                    put("lastScan", summary.lastScanTime)
+                    put("vaultPath", summary.vaultPath)
+                }
+                val patchReq = Request.Builder()
+                    .url("$DEFAULT_DATABASE_URL/devices/$deviceId.json")
+                    .patch(patchDev.toString().toRequestBody(jsonMediaType))
+                    .build()
+                httpClient.newCall(patchReq).execute()
             } catch (e: Exception) {
-                Log.e(TAG, "RTDB upload metadata error: ${e.message}")
+                Log.e(TAG, "Error uploading vault metadata: ${e.message}")
             }
+        }
+    }
+
+    suspend fun fetchHostFiles(deviceId: String): List<VaultFile> = withContext(Dispatchers.IO) {
+        try {
+            val req = Request.Builder().url("$DEFAULT_DATABASE_URL/devices/$deviceId/files.json").get().build()
+            val resp = httpClient.newCall(req).execute()
+            if (!resp.isSuccessful) return@withContext emptyList()
+
+            val body = resp.body?.string()?.trim() ?: "null"
+            if (body == "null" || body.isEmpty() || body == "[]") return@withContext emptyList()
+
+            val array = JSONArray(body)
+            val list = mutableListOf<VaultFile>()
+            for (i in 0 until array.length()) {
+                val obj = array.optJSONObject(i) ?: continue
+                list.add(
+                    VaultFile(
+                        fileId = obj.optString("fileId", "f_$i"),
+                        name = obj.optString("name", "file"),
+                        relativePath = obj.optString("relativePath", ""),
+                        size = obj.optLong("size", 0L),
+                        mimeType = obj.optString("mimeType", "*/*"),
+                        category = obj.optString("category", "Other"),
+                        lastModified = obj.optLong("lastModified", 0L),
+                        createdAt = obj.optLong("createdAt", 0L),
+                        hostDeviceId = deviceId,
+                        vaultId = obj.optString("vaultId", "")
+                    )
+                )
+            }
+            val filesMap = _syncedFiles.value.toMutableMap()
+            filesMap[deviceId] = list
+            _syncedFiles.value = filesMap
+            list
+        } catch (e: Exception) {
+            Log.e(TAG, "Error fetching host files: ${e.message}")
+            emptyList()
         }
     }
 
@@ -265,106 +479,251 @@ object FirebaseManager {
         map[pairing.code] = pairing
         _syncedPairings.value = map
 
-        if (isFirebaseInitialized && databaseRef != null) {
+        scope.launch {
             try {
-                databaseRef!!.child("pairings").child(pairing.code).setValue(pairing)
+                val json = JSONObject().apply {
+                    put("code", pairing.code)
+                    put("hostId", pairing.hostId)
+                    put("hostName", pairing.hostName)
+                    put("createdBy", pairing.createdBy)
+                    put("createdAt", pairing.createdAt)
+                    put("expiresAt", pairing.expiresAt)
+                    put("used", pairing.used)
+                }
+                val req = Request.Builder()
+                    .url("$DEFAULT_DATABASE_URL/pairings/${pairing.code}.json")
+                    .put(json.toString().toRequestBody(jsonMediaType))
+                    .build()
+                httpClient.newCall(req).execute()
             } catch (e: Exception) {
-                Log.e(TAG, "RTDB create pairing code error: ${e.message}")
+                Log.e(TAG, "Error creating pairing code in RTDB: ${e.message}")
             }
         }
         return pairing.code
     }
 
-    fun claimPairingCode(code: String, adminId: String): Result<HostDevice> {
-        val pairing = _syncedPairings.value[code]
-            ?: return Result.failure(Exception("Pairing code not found or expired"))
+    suspend fun claimPairingCode(code: String, adminId: String): Result<HostDevice> = withContext(Dispatchers.IO) {
+        val cleanCode = code.trim()
 
-        if (pairing.used) {
-            return Result.failure(Exception("Pairing code has already been used"))
-        }
+        try {
+            val req = Request.Builder().url("$DEFAULT_DATABASE_URL/pairings/$cleanCode.json").get().build()
+            val resp = httpClient.newCall(req).execute()
+            val body = resp.body?.string()?.trim() ?: "null"
 
-        if (System.currentTimeMillis() > pairing.expiresAt) {
-            return Result.failure(Exception("Pairing code has expired"))
-        }
+            if (body == "null" || body.isEmpty() || body == "{}") {
+                return@withContext Result.failure(Exception("كود الاقتران '$cleanCode' غير صحيح أو غير موجود."))
+            }
 
-        // Mark code as used
-        val updatedPairing = pairing.copy(used = true, usedByAdminId = adminId)
-        val pMap = _syncedPairings.value.toMutableMap()
-        pMap[code] = updatedPairing
-        _syncedPairings.value = pMap
+            val json = JSONObject(body)
+            val used = json.optBoolean("used", false)
+            val expiresAt = json.optLong("expiresAt", 0L)
+            val hostId = json.optString("hostId", "")
+            val hostName = json.optString("hostName", "Remote Host")
 
-        // Associate with admin
-        val adminMap = _adminPairedHosts.value.toMutableMap()
-        val hosts = adminMap[adminId]?.toMutableSet() ?: mutableSetOf()
-        hosts.add(pairing.hostId)
-        adminMap[adminId] = hosts
-        _adminPairedHosts.value = adminMap
+            if (used) {
+                return@withContext Result.failure(Exception("كود الاقتران تم استخدامه مسبقاً."))
+            }
+            if (System.currentTimeMillis() > expiresAt) {
+                return@withContext Result.failure(Exception("انتهت صلاحية كود الاقتران (أكثر من 10 دقائق)."))
+            }
 
-        val hostDevice = _syncedDevices.value[pairing.hostId]
-            ?: HostDevice(
-                deviceId = pairing.hostId,
-                name = pairing.hostName,
-                status = "ONLINE",
-                lastSeen = System.currentTimeMillis()
+            // Mark as used
+            val patch = JSONObject().apply {
+                put("used", true)
+                put("usedByAdminId", adminId)
+            }
+            val patchReq = Request.Builder()
+                .url("$DEFAULT_DATABASE_URL/pairings/$cleanCode.json")
+                .patch(patch.toString().toRequestBody(jsonMediaType))
+                .build()
+            httpClient.newCall(patchReq).execute()
+
+            // Associate admin
+            val adminMap = _adminPairedHosts.value.toMutableMap()
+            val hosts = adminMap[adminId]?.toMutableSet() ?: mutableSetOf()
+            hosts.add(hostId)
+            adminMap[adminId] = hosts
+            _adminPairedHosts.value = adminMap
+
+            // Return device
+            refreshDevicesFromCloudInternal()
+            val host = _syncedDevices.value[hostId] ?: HostDevice(
+                deviceId = hostId,
+                name = hostName,
+                status = "ONLINE"
             )
-
-        if (isFirebaseInitialized && databaseRef != null) {
-            try {
-                databaseRef!!.child("pairings").child(code).child("used").setValue(true)
-                databaseRef!!.child("pairings").child(code).child("usedByAdminId").setValue(adminId)
-                databaseRef!!.child("admin_hosts").child(adminId).child(pairing.hostId).setValue(true)
-            } catch (e: Exception) {
-                Log.e(TAG, "RTDB claim pairing code error: ${e.message}")
-            }
+            Result.success(host)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error claiming pairing code: ${e.message}")
+            Result.failure(Exception("فشل إتمام الاقتران: ${e.message}"))
         }
-
-        return Result.success(hostDevice)
     }
 
-    fun linkAdminHost(adminId: String, hostId: String) {
-        val adminMap = _adminPairedHosts.value.toMutableMap()
-        val hosts = adminMap[adminId]?.toMutableSet() ?: mutableSetOf()
-        hosts.add(hostId)
-        adminMap[adminId] = hosts
-        _adminPairedHosts.value = adminMap
+    private fun refreshPairingsFromCloudInternal() {
+        try {
+            val req = Request.Builder().url("$DEFAULT_DATABASE_URL/pairings.json").get().build()
+            val resp = httpClient.newCall(req).execute()
+            if (!resp.isSuccessful) return
+
+            val body = resp.body?.string()?.trim() ?: "null"
+            if (body == "null" || body.isEmpty()) return
+
+            val json = JSONObject(body)
+            val map = _syncedPairings.value.toMutableMap()
+            val keys = json.keys()
+            while (keys.hasNext()) {
+                val code = keys.next()
+                val pObj = json.optJSONObject(code) ?: continue
+                map[code] = PairingCodeData(
+                    code = code,
+                    hostId = pObj.optString("hostId", ""),
+                    hostName = pObj.optString("hostName", ""),
+                    createdBy = pObj.optString("createdBy", ""),
+                    createdAt = pObj.optLong("createdAt", 0L),
+                    expiresAt = pObj.optLong("expiresAt", 0L),
+                    used = pObj.optBoolean("used", false),
+                    usedByAdminId = pObj.optString("usedByAdminId", null)
+                )
+            }
+            _syncedPairings.value = map
+        } catch (e: Exception) {
+            Log.e(TAG, "Error refreshing pairings: ${e.message}")
+        }
     }
 
-    // --- Commands System ---
-    fun createCommand(command: BackupCommand): String {
-        val cmdList = (_syncedCommands.value[command.hostId] ?: emptyList()).toMutableList()
-        cmdList.add(0, command) // add to top
-        val cMap = _syncedCommands.value.toMutableMap()
-        cMap[command.hostId] = cmdList
-        _syncedCommands.value = cMap
+    // --- Commands System in Realtime Database ---
+    fun createCommand(command: BackupCommand) {
+        val currentMap = _syncedCommands.value.toMutableMap()
+        val list = currentMap[command.hostId]?.toMutableList() ?: mutableListOf()
+        list.removeAll { it.commandId == command.commandId }
+        list.add(0, command)
+        currentMap[command.hostId] = list
+        _syncedCommands.value = currentMap
 
-        if (isFirebaseInitialized && databaseRef != null) {
+        scope.launch {
             try {
-                databaseRef!!.child("commands").child(command.hostId).child(command.commandId).setValue(command)
+                val json = JSONObject().apply {
+                    put("commandId", command.commandId)
+                    put("type", command.type)
+                    put("status", command.status)
+                    put("hostId", command.hostId)
+                    put("adminId", command.adminId)
+                    put("createdAt", command.createdAt)
+                    put("progress", command.progress)
+                    put("currentFile", command.currentFile)
+                    put("speedBytesPerSec", command.speedBytesPerSec)
+                    put("filesProcessed", command.filesProcessed)
+                    put("totalFiles", command.totalFiles)
+                    val arr = JSONArray()
+                    command.fileIds.forEach { arr.put(it) }
+                    put("fileIds", arr)
+                }
+
+                val req = Request.Builder()
+                    .url("$DEFAULT_DATABASE_URL/commands/${command.hostId}/${command.commandId}.json")
+                    .put(json.toString().toRequestBody(jsonMediaType))
+                    .build()
+                httpClient.newCall(req).execute()
             } catch (e: Exception) {
-                Log.e(TAG, "RTDB create command error: ${e.message}")
+                Log.e(TAG, "Error creating command in RTDB: ${e.message}")
             }
         }
-        return command.commandId
     }
 
     fun updateCommand(command: BackupCommand) {
-        val cmdList = (_syncedCommands.value[command.hostId] ?: emptyList()).toMutableList()
-        val index = cmdList.indexOfFirst { it.commandId == command.commandId }
-        if (index != -1) {
-            cmdList[index] = command
+        val currentMap = _syncedCommands.value.toMutableMap()
+        val list = currentMap[command.hostId]?.toMutableList() ?: mutableListOf()
+        val idx = list.indexOfFirst { it.commandId == command.commandId }
+        if (idx >= 0) {
+            list[idx] = command
         } else {
-            cmdList.add(0, command)
+            list.add(0, command)
         }
-        val cMap = _syncedCommands.value.toMutableMap()
-        cMap[command.hostId] = cmdList
-        _syncedCommands.value = cMap
+        currentMap[command.hostId] = list
+        _syncedCommands.value = currentMap
 
-        if (isFirebaseInitialized && databaseRef != null) {
+        scope.launch {
             try {
-                databaseRef!!.child("commands").child(command.hostId).child(command.commandId).setValue(command)
+                val json = JSONObject().apply {
+                    put("status", command.status)
+                    put("progress", command.progress)
+                    put("currentFile", command.currentFile)
+                    put("speedBytesPerSec", command.speedBytesPerSec)
+                    put("filesProcessed", command.filesProcessed)
+                    put("totalFiles", command.totalFiles)
+                    if (command.startedAt != null) put("startedAt", command.startedAt)
+                    if (command.completedAt != null) put("completedAt", command.completedAt)
+                    if (command.error != null) put("error", command.error)
+                }
+
+                val req = Request.Builder()
+                    .url("$DEFAULT_DATABASE_URL/commands/${command.hostId}/${command.commandId}.json")
+                    .patch(json.toString().toRequestBody(jsonMediaType))
+                    .build()
+                httpClient.newCall(req).execute()
             } catch (e: Exception) {
-                Log.e(TAG, "RTDB update command error: ${e.message}")
+                Log.e(TAG, "Error updating command in RTDB: ${e.message}")
             }
+        }
+    }
+
+    private fun refreshCommandsFromCloudInternal() {
+        try {
+            val req = Request.Builder().url("$DEFAULT_DATABASE_URL/commands.json").get().build()
+            val resp = httpClient.newCall(req).execute()
+            if (!resp.isSuccessful) return
+
+            val body = resp.body?.string()?.trim() ?: "null"
+            if (body == "null" || body.isEmpty() || body == "{}") return
+
+            val json = JSONObject(body)
+            val currentMap = _syncedCommands.value.toMutableMap()
+
+            val hostKeys = json.keys()
+            while (hostKeys.hasNext()) {
+                val hostId = hostKeys.next()
+                val hostCmds = json.optJSONObject(hostId) ?: continue
+                val cmdList = mutableListOf<BackupCommand>()
+
+                val cmdKeys = hostCmds.keys()
+                while (cmdKeys.hasNext()) {
+                    val cmdId = cmdKeys.next()
+                    val cObj = hostCmds.optJSONObject(cmdId) ?: continue
+
+                    val fIds = mutableListOf<String>()
+                    val fArr = cObj.optJSONArray("fileIds")
+                    if (fArr != null) {
+                        for (i in 0 until fArr.length()) {
+                            fIds.add(fArr.optString(i))
+                        }
+                    }
+
+                    cmdList.add(
+                        BackupCommand(
+                            commandId = cmdId,
+                            type = cObj.optString("type", CommandType.SCAN.name),
+                            status = cObj.optString("status", CommandStatus.PENDING.name),
+                            hostId = hostId,
+                            adminId = cObj.optString("adminId", ""),
+                            fileIds = fIds,
+                            createdAt = cObj.optLong("createdAt", System.currentTimeMillis()),
+                            startedAt = if (cObj.has("startedAt")) cObj.optLong("startedAt") else null,
+                            completedAt = if (cObj.has("completedAt")) cObj.optLong("completedAt") else null,
+                            progress = cObj.optInt("progress", 0),
+                            currentFile = if (cObj.has("currentFile")) cObj.optString("currentFile") else null,
+                            speedBytesPerSec = cObj.optLong("speedBytesPerSec", 0L),
+                            filesProcessed = cObj.optInt("filesProcessed", 0),
+                            totalFiles = cObj.optInt("totalFiles", 0),
+                            error = if (cObj.has("error")) cObj.optString("error") else null
+                        )
+                    )
+                }
+                cmdList.sortByDescending { it.createdAt }
+                currentMap[hostId] = cmdList
+            }
+            _syncedCommands.value = currentMap
+        } catch (e: Exception) {
+            Log.e(TAG, "Error refreshing commands: ${e.message}")
         }
     }
 }

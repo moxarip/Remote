@@ -103,14 +103,13 @@ fun RemoteBackupAppContent(viewModel: MainViewModel) {
             AppScreen.SPLASH -> {
                 SplashScreen(
                     onSplashFinished = {
-                        currentScreen = if (currentUser == null) {
-                            AppScreen.AUTH
-                        } else if (currentUser?.selectedRole == null || currentUser?.selectedRole == DeviceRole.UNSET) {
-                            AppScreen.ROLE_SELECT
-                        } else if (currentUser?.selectedRole == DeviceRole.HOST) {
-                            AppScreen.HOST_DASHBOARD
+                        if (viewModel.repository.hasSavedHostSession()) {
+                            // Host phone left at home: auto-boot directly into Host Dashboard without login or tampering!
+                            viewModel.restoreHostSession()
+                            currentScreen = AppScreen.HOST_DASHBOARD
                         } else {
-                            AppScreen.ADMIN_DASHBOARD
+                            // Admin phone: requires login on every launch for security
+                            currentScreen = AppScreen.AUTH
                         }
                     }
                 )
@@ -128,13 +127,14 @@ fun RemoteBackupAppContent(viewModel: MainViewModel) {
                 )
                 // When authenticated, transition
                 LaunchedEffect(currentUser) {
-                    if (currentUser != null) {
-                        currentScreen = if (currentUser?.selectedRole == null || currentUser?.selectedRole == DeviceRole.UNSET) {
-                            AppScreen.ROLE_SELECT
-                        } else if (currentUser?.selectedRole == DeviceRole.HOST) {
-                            AppScreen.HOST_DASHBOARD
-                        } else {
-                            AppScreen.ADMIN_DASHBOARD
+                    val user = currentUser
+                    if (user != null) {
+                        val savedRole = viewModel.repository.getSavedRole()
+                        currentScreen = when {
+                            savedRole == DeviceRole.ADMIN -> AppScreen.ADMIN_DASHBOARD
+                            user.selectedRole == DeviceRole.HOST || savedRole == DeviceRole.HOST -> AppScreen.HOST_DASHBOARD
+                            user.selectedRole == DeviceRole.ADMIN -> AppScreen.ADMIN_DASHBOARD
+                            else -> AppScreen.ROLE_SELECT
                         }
                     }
                 }
@@ -174,11 +174,15 @@ fun RemoteBackupAppContent(viewModel: MainViewModel) {
             }
 
             AppScreen.ADMIN_DASHBOARD -> {
+                LaunchedEffect(Unit) {
+                    viewModel.refreshDevices()
+                }
                 AdminDashboardScreen(
                     hosts = pairedHosts,
                     showAddDialog = pairingDialogVisible,
                     pairingCodeInput = pairingInputCode,
                     pairingError = pairingError,
+                    currentUserEmail = currentUser?.email ?: "",
                     onOpenAddDialog = viewModel::openAddHostDialog,
                     onCloseAddDialog = viewModel::closeAddHostDialog,
                     onPairingCodeChanged = viewModel::onPairingInputCodeChanged,
